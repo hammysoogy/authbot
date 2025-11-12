@@ -1,255 +1,201 @@
-"""
-bot_api.py
-Safe Discord bot + Flask API template.
-Use for legitimate admin/auth tasks. Do NOT use to gate cheating/exploit tools.
-"""
-
+# app.py
 import os
+import asyncio
 import time
 import secrets
-import asyncio
-import threading
-import json
-from typing import Optional, Dict, Any
-
-from flask import Flask, request, jsonify
-from discord.ext import commands
+from aiohttp import web
+import base64
 import discord
 
-# Optional MongoDB
-try:
-    from pymongo import MongoClient
-    MONGO_AVAILABLE = True
-except Exception:
-    MONGO_AVAILABLE = False
-
-# ----------------- Configuration (via env vars) -----------------
+# ---------- Configuration (set these in Render environment variables) ----------
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")  # required
-LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0"))  # required
-API_KEY = os.environ.get("API_KEY", "")  # required: shared secret used by your trusted server
-MONGO_URI = os.environ.get("MONGO_URI", None)  # optional (recommended)
-FLASK_PORT = int(os.environ.get("PORT", "10000"))  # Render uses PORT env by default
-# ----------------------------------------------------------------
+RENDER_DOMAIN = os.environ.get("RENDER_DOMAIN", "https://authbot-hn9s.onrender.com")  # your-render URL
+PORT = int(os.environ.get("PORT", 10000))
+TOKEN_TTL = int(os.environ.get("TOKEN_TTL", 60))  # seconds
+BOT_PREFIX = os.environ.get("BOT_PREFIX", "!")
+SCRIPT_STORE = {}  # script_id -> lua text; (for demo we load from env or you can load from files)
+
+# Example small script map (replace by loading from secure storage or env vars)
+# You can set environment variables like SCRIPT_<ID> or load from a secure file.
+# For demo: a default demo script if none specified.
+DEFAULT_SCRIPT = os.environ.get("SCRIPT_TEXT", 'print("hello from server!")')
+
+# optional: comma-separated role IDs or user IDs allowed to request
+ALLOWED_ROLE_IDS = set(x.strip() for x in os.environ.get("ALLOWED_ROLE_IDS", "").split(",") if x.strip())
 
 if not DISCORD_TOKEN:
-    raise SystemExit("DISCORD_TOKEN env var required")
-if not LOG_CHANNEL_ID:
-    raise SystemExit("LOG_CHANNEL_ID env var required")
-if not API_KEY:
-    raise SystemExit("API_KEY env var required")
+    raise RuntimeError("DISCORD_TOKEN environment variable is required")
 
-# ----------------- Storage abstraction -----------------
-class Storage:
-    """Simple abstraction: use MongoDB if available, otherwise in-memory dicts."""
-    def __init__(self, mongo_uri: Optional[str] = None):
-        self.mongo = None
-        self.db = None
-        self.keys_coll = None
-        self.blacklist_coll = None
-        if mongo_uri and MONGO_AVAILABLE:
-            try:
-                self.mongo = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-                # try a quick ping
-                self.mongo.admin.command('ping')
-                self.db = self.mongo.get_database("bot_api_db")
-                self.keys_coll = self.db.get_collection("keys")
-                self.blacklist_coll = self.db.get_collection("blacklist")
-                # create simple indexes
-                self.keys_coll.create_index("key", unique=True)
-                self.blacklist_coll.create_index("hwid", unique=True)
-                print("Using MongoDB persistence.")
-            except Exception as e:
-                print("Failed to connect to MongoDB, falling back to in-memory. Error:", e)
-                self.mongo = None
+# If you want to populate scripts from env like SCRIPT_d229253... = "<lua code>"
+for k, v in os.environ.items():
+    if k.startswith("SCRIPT_"):
+        script_id = k[len("SCRIPT_"):]
+        SCRIPT_STORE[script_id] = v
 
-        if not self.mongo:
-            self._keys: Dict[str, Dict[str, Any]] = {}
-            self._blacklist = set()
-            print("Using in-memory persistence (volatile).")
+# ---------- In-memory single-use token store ----------
+# token -> { user_id: str, script_id: str, expires_at: float }
+token_store = {}
+token_lock = asyncio.Lock()
 
-    # keys API
-    def create_key(self, key: str, expires_at: float):
-        if self.mongo:
-            doc = {"key": key, "expires_at": expires_at, "active": True, "created_at": time.time()}
-            self.keys_coll.insert_one(doc)
-        else:
-            self._keys[key] = {"expires_at": expires_at, "active": True, "created_at": time.time()}
+def make_token(user_id: str, script_id: str, ttl: int = TOKEN_TTL) -> str:
+    token = secrets.token_hex(24)
+    expires_at = time.time() + ttl
+    token_store[token] = {"user_id": str(user_id), "script_id": str(script_id), "expires_at": expires_at}
+    return token
 
-    def get_key(self, key: str) -> Optional[Dict[str, Any]]:
-        if self.mongo:
-            doc = self.keys_coll.find_one({"key": key})
-            if doc:
-                return {"key": doc["key"], "expires_at": doc["expires_at"], "active": doc.get("active", True)}
-            return None
-        else:
-            return self._keys.get(key)
+def validate_and_consume_token(token: str, script_id: str, user_id: str) -> bool:
+    row = token_store.get(token)
+    if not row:
+        return False
+    if row["user_id"] != str(user_id):
+        return False
+    if row["script_id"] != str(script_id):
+        return False
+    if time.time() > row["expires_at"]:
+        token_store.pop(token, None)
+        return False
+    # consume token
+    token_store.pop(token, None)
+    return True
 
-    def set_key_inactive(self, key: str):
-        if self.mongo:
-            self.keys_coll.update_one({"key": key}, {"$set": {"active": False}})
-        else:
-            if key in self._keys:
-                self._keys[key]["active"] = False
+async def cleanup_expired_tokens():
+    while True:
+        now = time.time()
+        async with token_lock:
+            for k, v in list(token_store.items()):
+                if v["expires_at"] <= now:
+                    token_store.pop(k, None)
+        await asyncio.sleep(30)
 
-    # blacklist API
-    def add_blacklist(self, hwid: str):
-        if self.mongo:
-            self.blacklist_coll.update_one({"hwid": hwid}, {"$set": {"hwid": hwid, "created_at": time.time()}}, upsert=True)
-        else:
-            self._blacklist.add(hwid)
+# ---------- aiohttp webserver ----------
+routes = web.RouteTableDef()
 
-    def is_blacklisted(self, hwid: str) -> bool:
-        if self.mongo:
-            return self.blacklist_coll.count_documents({"hwid": hwid}, limit=1) > 0
-        else:
-            return hwid in self._blacklist
+@routes.get("/files/loaders/{script_id}/{token}.lua")
+async def serve_loader(request: web.Request):
+    script_id = request.match_info.get("script_id")
+    token = request.match_info.get("token")
+    # The Discord-bot ties token -> user. We need to know who is requesting.
+    # The Roblox HttpGet won't include a Discord user header, so we rely on:
+    # token is single-use and unguessable. To tighten, you may include a HMAC
+    # or require the token include the user id encoded; here we keep token single-use.
+    if not script_id or not token:
+        return web.Response(text="bad request", status=400)
 
-    def expire_key(self, key: str) -> bool:
-        if self.mongo:
-            res = self.keys_coll.update_one({"key": key}, {"$set": {"active": False}})
-            return res.modified_count > 0
-        else:
-            if key in self._keys:
-                self._keys[key]["active"] = False
-                return True
-            return False
+    # Validate token exists and is for this script; consume it only if valid.
+    async with token_lock:
+        row = token_store.get(token)
+        if not row:
+            return web.Response(text="invalid or expired token", status=403)
+        if row["script_id"] != script_id:
+            return web.Response(text="invalid token for script", status=403)
+        # If you want to tie to a particular user ID, validate here by comparing headers.
+        # NOTE: Roblox HttpGet normally doesn't let you set custom headers, so we don't require them.
+        # consume:
+        token_store.pop(token, None)
 
-# Instantiate storage
-storage = Storage(mongo_uri=MONGO_URI)
+    # Fetch script content
+    lua_text = SCRIPT_STORE.get(script_id)
+    if lua_text is None:
+        # fallback to default if you wish
+        lua_text = DEFAULT_SCRIPT
 
-# ----------------- Flask app -----------------
-app = Flask(__name__)
+    # Optionally: serve minified/obfuscated content
+    return web.Response(text=lua_text, content_type="text/plain")
 
-def require_api_key(data: dict) -> (bool, tuple):
-    """Validate presence and correctness of API key in JSON body"""
-    if not data:
-        return False, (jsonify({"ok": False, "error": "missing_json"}), 400)
-    if data.get("api_key") != API_KEY:
-        return False, (jsonify({"ok": False, "error": "unauthorized"}), 403)
-    return True, None
+async def make_app():
+    app = web.Application()
+    app.add_routes(routes)
+    return app
 
-@app.route("/validate", methods=["POST"])
-def validate():
-    """
-    POST JSON:
-    {
-      "api_key": "...",
-      "key": "KEYSTRING",
-      "username": "Name",    # optional but useful for logs
-      "hwid": "SOMEID"      # optional identifier to blacklist
-    }
-    Response:
-    { ok: true, valid: true/false, reason: "..." }
-    """
-    data = request.get_json(silent=True)
-    ok, err = require_api_key(data)
-    if not ok:
-        return err
-
-    key = data.get("key", "")
-    username = data.get("username", "unknown")
-    hwid = data.get("hwid", None)
-
-    # Check blacklist first
-    if hwid and storage.is_blacklisted(hwid):
-        return jsonify({"ok": True, "valid": False, "reason": "blacklisted"})
-
-    # Look up key
-    rec = storage.get_key(key)
-    if not rec:
-        return jsonify({"ok": True, "valid": False, "reason": "invalid"})
-
-    if not rec.get("active", True):
-        return jsonify({"ok": True, "valid": False, "reason": "inactive"})
-
-    if rec.get("expires_at", 0) < time.time():
-        # expire it and respond
-        storage.set_key_inactive(key)
-        return jsonify({"ok": True, "valid": False, "reason": "expired"})
-
-    # mark used (if you want keys one-time)
-    storage.set_key_inactive(key)
-
-    # Log to Discord channel (async task)
-    async def send_log():
-        try:
-            embed = discord.Embed(title="Key Redeemed", color=0x00FF00)
-            embed.add_field(name="User", value=username, inline=True)
-            embed.add_field(name="Key", value=key, inline=True)
-            embed.add_field(name="HWID", value=hwid or "—", inline=False)
-            embed.timestamp = discord.utils.utcnow()
-            ch = bot.get_channel(LOG_CHANNEL_ID)
-            if ch:
-                await ch.send(embed=embed)
-        except Exception as e:
-            print("Discord log failed:", e)
-
-    # schedule coroutine
-    try:
-        asyncio.get_event_loop().create_task(send_log())
-    except RuntimeError:
-        # if no running loop, schedule onto bot loop
-        bot.loop.create_task(send_log())
-
-    return jsonify({"ok": True, "valid": True, "reason": "accepted"})
-
-# health check
-@app.route("/")
-def index():
-    return "<html><body><h2>Bot API running</h2></body></html>"
-
-# ----------------- Discord Bot -----------------
+# ---------- Discord bot ----------
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.message_content = True
+intents.members = True
 
-@bot.event
+client = discord.Client(intents=intents)
+
+def user_allowed_to_request(member: discord.Member) -> bool:
+    if not ALLOWED_ROLE_IDS:
+        return True
+    if str(member.id) in ALLOWED_ROLE_IDS:
+        return True
+    for r in getattr(member, "roles", []):
+        if str(r.id) in ALLOWED_ROLE_IDS:
+            return True
+    return False
+
+@client.event
 async def on_ready():
-    print(f"Discord bot ready as {bot.user} (id {bot.user.id})")
-    # Sync application commands
+    print(f"Discord bot ready. Logged in as {client.user} (id: {client.user.id})")
+
+@client.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    content = message.content.strip()
+    if not content.startswith(BOT_PREFIX):
+        return
+    args = content[len(BOT_PREFIX):].strip().split()
+    if not args:
+        return
+    cmd = args[0].lower()
+
+    if cmd == "getscript":
+        # usage: !getscript <script_id>
+        if len(args) < 2:
+            await message.reply("Usage: `!getscript <script_id>`")
+            return
+        script_id = args[1]
+        # check permission if in guild
+        allowed = True
+        if isinstance(message.author, discord.Member):
+            allowed = user_allowed_to_request(message.author)
+        if not allowed:
+            await message.reply("You are not authorized to request scripts.")
+            return
+
+        # verify script exists (optional)
+        if script_id not in SCRIPT_STORE:
+            await message.reply("Unknown script id.")
+            return
+
+        # create token and DM user the loader URL
+        async with token_lock:
+            token = make_token(message.author.id, script_id, ttl=TOKEN_TTL)
+
+        url = f"https://{RENDER_DOMAIN}/files/loaders/{script_id}/{token}.lua"
+        dm_text = (
+            f"Here is your one-time loader URL (valid {TOKEN_TTL} seconds / single-use):\n\n"
+            f"`loadstring(game:HttpGet(\"{url}\"))()`\n\n"
+            f"Use it immediately — the token will be consumed on first fetch or after expiry."
+        )
+        try:
+            await message.author.send(dm_text)
+            if message.guild:
+                await message.reply("I sent you the loader URL in DMs.")
+        except discord.Forbidden:
+            await message.reply("I couldn't DM you. Please enable DMs and try again.")
+        except Exception as e:
+            await message.reply(f"Failed to send DM: {e}")
+
+# ---------- Entrypoint ----------
+async def main():
+    # token cleanup background task
+    asyncio.create_task(cleanup_expired_tokens())
+
+    # start aiohttp web app
+    app = await make_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"Web server started on port {PORT}")
+
+    # start discord bot (blocks)
     try:
-        await bot.tree.sync()
-        print("Slash commands synced")
-    except Exception as e:
-        print("Failed to sync commands:", e)
-
-# Slash commands
-@bot.tree.command(name="generate", description="Generate a one-time key for X minutes")
-async def slash_generate(interaction: discord.Interaction, minutes: int = 10):
-    # create a key valid for `minutes`
-    key = secrets.token_hex(8).upper()
-    expires_at = time.time() + max(1, int(minutes)) * 60
-    storage.create_key(key, expires_at)
-    await interaction.response.send_message(f"🔑 Key: `{key}` valid for {minutes} minutes", ephemeral=True)
-
-@bot.tree.command(name="expire", description="Expire a key immediately")
-async def slash_expire(interaction: discord.Interaction, key: str):
-    ok = storage.expire_key(key)
-    if ok:
-        await interaction.response.send_message(f"⛔ Key `{key}` expired.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"⚠️ Key not found.", ephemeral=True)
-
-@bot.tree.command(name="blacklist", description="Blacklist an HWID (blocks validate)")
-async def slash_blacklist(interaction: discord.Interaction, hwid: str):
-    storage.add_blacklist(hwid)
-    await interaction.response.send_message(f"🚫 HWID `{hwid}` blacklisted.", ephemeral=True)
-
-# ----------------- Runner -----------------
-def run_flask():
-    # Render will supply PORT via env var
-    port = int(os.environ.get("PORT", FLASK_PORT))
-    # Use 0.0.0.0 to be reachable
-    app.run(host="0.0.0.0", port=port)
-
-async def run_bot():
-    await bot.start(DISCORD_TOKEN)
-
-def main():
-    # start Flask in a background thread
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
-    # run bot in main thread loop
-    asyncio.run(run_bot())
+        await client.start(DISCORD_TOKEN)
+    finally:
+        await runner.cleanup()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
