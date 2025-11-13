@@ -2,66 +2,32 @@ import os
 import random
 import string
 import threading
-import base64
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, Response
 import discord
 from discord.ext import commands
-from discord import app_commands, ui, ButtonStyle
+from discord import ui, ButtonStyle
 
-# -----------------------
+# ----------------------
 # Configuration
-# -----------------------
+# ----------------------
 KEY_LIFETIME_MINUTES = int(os.getenv("KEY_LIFETIME_MINUTES", "10"))
 RENDER_DOMAIN = os.getenv("RENDER_DOMAIN", "authbot-hn9s.onrender.com")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# -----------------------
+# The external script URL you want the loader to execute
+EXTERNAL_SCRIPT_URL = "https://pastefy.app/1YBZrX1C/raw"
+
+# ----------------------
 # App + in-memory store
-# -----------------------
+# ----------------------
 app = Flask(__name__)
 valid_keys = {}  # key -> {discord_name, discord_id, created_at, script_id(optional)}
 
-# -----------------------
-# Discord bot setup
-# -----------------------
-intents = discord.Intents.default()
-intents.messages = True
-intents.guilds = True
-bot = commands.Bot(command_prefix="/", intents=intents)
-tree = bot.tree
-log_channel = None
-
-
-# -----------------------
-# Revoke button view
-# -----------------------
-class RevokeButton(ui.View):
-    def __init__(self, key):
-        super().__init__(timeout=None)
-        self.key = key
-
-    @ui.button(label="Revoke Key", style=ButtonStyle.danger)
-    async def revoke(self, interaction: discord.Interaction, button: ui.Button):
-        if self.key in valid_keys:
-            del valid_keys[self.key]
-            await interaction.response.send_message(f"🔒 Key `{self.key}` revoked.", ephemeral=True)
-            try:
-                embed = interaction.message.embeds[0]
-                new_embed = embed.copy()
-                new_embed.color = discord.Color.red()
-                new_embed.add_field(name="Revoked By", value=f"{interaction.user} ({interaction.user.id})", inline=False)
-                new_embed.set_footer(text=f"Revoked at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-                await interaction.message.edit(embed=new_embed, view=None)
-            except Exception:
-                pass
-        else:
-            await interaction.response.send_message("❌ Already revoked.", ephemeral=True)
-
-
-# -----------------------
-# Helper: create key
-# -----------------------
+# ----------------------
+# Helper functions
+# ----------------------
 def make_key(owner_name: str, owner_id: int, script_id: str = None):
     key = ''.join(random.choices(string.ascii_letters + string.digits, k=24))
     valid_keys[key] = {
@@ -72,149 +38,148 @@ def make_key(owner_name: str, owner_id: int, script_id: str = None):
     }
     return key
 
-
-# -----------------------
-# Redeem endpoint (called by loader running inside Roblox client)
-# -----------------------
-# returns JSON: { "ok": true, "script_b64": "<base64>", "script_id": "...", "key": "..." }
-@app.route("/redeem/<key>", methods=["GET"])
-def redeem_key(key):
-    # optional: script_id param for extra validation
-    script_id = request.args.get("script_id", "")
-    roblox_name = request.args.get("roblox_name", "")  # from the client loader, optional
-    # validate key exists
+def key_is_valid_and_consume(key: str, script_id: str = None) -> (bool, str):
+    """
+    Validate TTL and script id if provided. If valid, consume (delete) the key and return (True, "").
+    If invalid, return (False, reason).
+    """
     info = valid_keys.get(key)
     if not info:
-        return jsonify({"ok": False, "error": "invalid_or_expired"}), 403
-
-    # check TTL
+        return False, "invalid_or_missing"
     created = datetime.fromisoformat(info["created_at"])
     if datetime.utcnow() - created > timedelta(minutes=KEY_LIFETIME_MINUTES):
-        # expire
+        # expired
         del valid_keys[key]
-        return jsonify({"ok": False, "error": "expired"}), 403
-
-    # Optional: enforce script_id match if stored (not required)
+        return False, "expired"
+    # optional script scope
     if info.get("script_id") and script_id and info["script_id"] != script_id:
-        return jsonify({"ok": False, "error": "script_mismatch"}), 403
-
-    # load actual script from env var: script_id uppercased
-    if not script_id:
-        return jsonify({"ok": False, "error": "missing_script_id"}), 400
-    env_name = script_id.upper()
-    script_code = os.getenv(env_name)
-    if not script_code:
-        return jsonify({"ok": False, "error": "script_not_found"}), 404
-
-    # consume the key (one-time)
+        return False, "script_mismatch"
+    # consume
     try:
         del valid_keys[key]
     except KeyError:
         pass
+    return True, ""
 
-    # log redemption to discord (async)
+# ----------------------
+# Flask route: serve lua when ?key= is provided
+# ----------------------
+@app.route("/files/loaders/<script_id>/<file_id>.lua")
+def serve_loader_with_key(script_id, file_id):
+    """
+    If ?key= is present and valid, return a small loader Lua which fetches and runs EXTERNAL_SCRIPT_URL.
+    Otherwise deny (403) with a short message (no script disclosure).
+    """
+    key = request.args.get("key")
+    if not key:
+        return Response("-- Missing key parameter. Access denied.", mimetype="text/plain"), 403
+
+    ok, reason = key_is_valid_and_consume(key, script_id=script_id)
+    if not ok:
+        # do not reveal details beyond a short reason
+        if reason == "expired":
+            return Response("-- Key expired. Please generate a new key.", mimetype="text/plain"), 403
+        if reason == "script_mismatch":
+            return Response("-- Key not valid for this script.", mimetype="text/plain"), 403
+        return Response("-- Invalid or missing key. Access denied.", mimetype="text/plain"), 403
+
+    # Build loader Lua that executes the external script URL
+    # This loader is minimal and immediately runs the external raw URL via game:HttpGet + loadstring.
+    loader_lua = (
+        f'-- Loader returned by auth server (executes external script)\n'
+        f'local ok, res = pcall(function() return game:HttpGet("{EXTERNAL_SCRIPT_URL}") end)\n'
+        f'if not ok or not res then warn("Failed to fetch external script:", res); return end\n'
+        f'local fn, err = loadstring(res)\n'
+        f'if not fn then warn("Failed to load external script:", err); return end\n'
+        f'pcall(fn)\n'
+    )
+
+    # Log to Discord (non-blocking)
     try:
-        if log_channel:
-            embed = discord.Embed(title="🔑 Key Redeemed", color=discord.Color.green(), timestamp=datetime.utcnow())
+        if LOG_CHANNEL_ID and bot and bot.is_ready():
+            embed = discord.Embed(
+                title="🧩 Script Executed",
+                color=discord.Color.green(),
+                timestamp=datetime.utcnow()
+            )
             embed.add_field(name="Script ID", value=script_id, inline=False)
-            embed.add_field(name="Key", value=f"`{key}`", inline=False)
-            embed.add_field(name="Redeemed by (roblox)", value=f"{roblox_name or 'unknown'}", inline=False)
-            embed.add_field(name="Key Creator (discord)", value=f"{info.get('discord_name')} ({info.get('discord_id')})", inline=False)
+            embed.add_field(name="Key (consumed)", value=f"`{key}`", inline=False)
+            embed.set_footer(text="Auth System Log")
             view = RevokeButton(key)
             bot.loop.create_task(log_channel.send(embed=embed, view=view))
     except Exception:
         pass
 
-    # Return the script as base64 to avoid text/encoding problems
-    b64 = base64.b64encode(script_code.encode("utf-8")).decode("ascii")
-    return jsonify({"ok": True, "script_b64": b64, "script_id": script_id})
-
-
-# -----------------------
-# Loader file endpoint (NO KEY in URL)
-# serves a small loader that expects a global 'script_key' variable
-# -----------------------
-@app.route("/files/loaders/<script_id>/<file_id>.lua")
-def serve_loader(script_id, file_id):
-    """
-    Returns a small loader Lua that:
-      1) reads global `script_key` set by the executor user
-      2) calls /redeem/<key>?script_id=<script_id>&roblox_name=<PlayerName>
-      3) on success decodes base64 script and runs it via loadstring
-    """
-    domain = RENDER_DOMAIN
-    loader_lua = f'''-- Loader (no key in URL). Set script_key before running the loadstring.
-local HttpService = game:GetService("HttpService")
-local Players = game:GetService("Players")
-local player = Players.LocalPlayer
-
--- script_key must be defined by the user before running this loader:
--- script_key = "YOUR_KEY"
-if not script_key or type(script_key) ~= "string" or script_key == "" then
-    error("script_key not set; please put your key in script_key before running.")
-    return
-end
-
-local function safe_get(url)
-    local ok, res = pcall(function() return HttpService:GetAsync(url) end)
-    if not ok then return nil, res end
-    return res, nil
-end
-
-local key = script_key
-local redeem_url = string.format("https://{domain}/redeem/%s?script_id={script_id}&roblox_name=%s", key, HttpService:UrlEncode(player.Name))
-local body, err = safe_get(redeem_url)
-if not body then
-    warn("Failed to contact auth server:", err)
-    return
-end
-
-local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
-if not ok or not data or not data.ok then
-    warn("Key redeem failed:", (data and data.error) or tostring(body))
-    return
-end
-
--- decode base64 script and run it
-local b64 = data.script_b64
-local bytes = HttpService:Base64Decode(b64)
-local func, load_err = loadstring(bytes)
-if not func then
-    warn("Failed to load script:", load_err)
-    return
-end
-
--- run the protected script
-pcall(func)
-'''
-    # Return loader as plain text
     return Response(loader_lua, mimetype="text/plain")
 
+# ----------------------
+# Discord Bot Setup
+# ----------------------
+intents = discord.Intents.default()
+intents.messages = True
+intents.guilds = True
+bot = commands.Bot(command_prefix="/", intents=intents)
+tree = bot.tree
+log_channel = None
 
-# -----------------------
-# Bot Slash commands (genkey, deletekey, listkeys, script)
-# -----------------------
-@tree.command(name="genkey", description="Generate a one-time script key")
+# ----------------------
+# Revoke button view
+# ----------------------
+class RevokeButton(ui.View):
+    def __init__(self, key):
+        super().__init__(timeout=None)
+        self.key = key
+
+    @ui.button(label="Revoke Key", style=ButtonStyle.danger)
+    async def revoke(self, interaction: discord.Interaction, button: ui.Button):
+        # If key exists (unlikely after consumption) remove it; otherwise report already consumed
+        if self.key in valid_keys:
+            del valid_keys[self.key]
+            await interaction.response.send_message(f"🔒 Key `{self.key}` revoked.", ephemeral=True)
+            try:
+                embed = interaction.message.embeds[0]
+                new_embed = embed.copy()
+                new_embed.color = discord.Color.red()
+                new_embed.add_field(name="Revoked By", value=f"{interaction.user} ({interaction.user.id})", inline=False)
+                await interaction.message.edit(embed=new_embed, view=None)
+            except Exception:
+                pass
+        else:
+            await interaction.response.send_message("❌ Key already consumed or revoked.", ephemeral=True)
+
+# ----------------------
+# Slash commands
+# ----------------------
+@tree.command(name="genkey", description="Generate a one-time script key (optionally tied to a script id)")
 async def genkey(interaction: discord.Interaction, script_name: str = None):
-    k = make_key(interaction.user.name, interaction.user.id, script_id=script_name.lower() if script_name else None)
-    await interaction.response.send_message(f"✅ Key: `{k}` (one-time, expires in {KEY_LIFETIME_MINUTES} minutes)", ephemeral=True)
+    script_id = script_name.lower() if script_name else None
+    k = make_key(interaction.user.name, interaction.user.id, script_id=script_id)
+    # DM user the key and instructions
+    url_example = f'https://{RENDER_DOMAIN}/files/loaders/{script_id or "script_id"}/<fileid>.lua?key={k}'
+    try:
+        await interaction.user.send(f"🔑 Your key: `{k}`\nLoader example:\n```lua\nloadstring(game:HttpGet(\"{url_example}\"))()\n```")
+        await interaction.response.send_message("✅ Key generated and DM'd to you.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(f"✅ Key: `{k}` (unable to DM) — use the URL: {url_example}", ephemeral=True)
 
+@tree.command(name="script", description="Get a loader URL for a script id (placeholder key)")
+async def script(interaction: discord.Interaction, script_name: str):
+    script_id = script_name.lower()
+    file_id = ''.join(random.choices('abcdef0123456789', k=40))
+    url = f"https://{RENDER_DOMAIN}/files/loaders/{script_id}/{file_id}.lua?key={{key}}"
+    loadstring_code = f'loadstring(game:HttpGet("{url}"))()'
+    try:
+        await interaction.user.send(f"Loader for `{script_id}`:\n```lua\n{loadstring_code}\n```")
+        await interaction.response.send_message("📩 Sent loader URL to your DMs (replace {key} with your key)", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(f"Loader: ```lua\n{loadstring_code}\n```", ephemeral=True)
 
-@tree.command(name="deletekey", description="Delete/revoke a key")
-async def deletekey(interaction: discord.Interaction, key: str):
-    if key in valid_keys:
-        del valid_keys[key]
-        await interaction.response.send_message(f"🗑️ Key `{key}` deleted.", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ Key not found.", ephemeral=True)
-
-
-@tree.command(name="listkeys", description="Show active keys")
+@tree.command(name="listkeys", description="List active (unexpired) keys")
 async def listkeys(interaction: discord.Interaction):
     if not valid_keys:
-        await interaction.response.send_message("No active keys", ephemeral=True)
+        await interaction.response.send_message("No active keys.", ephemeral=True)
         return
-    embed = discord.Embed(title="Active Keys", color=discord.Color.blue())
+    embed = discord.Embed(title="🔑 Active Keys", color=discord.Color.blue())
     now = datetime.utcnow()
     for key, info in list(valid_keys.items()):
         created = datetime.fromisoformat(info["created_at"])
@@ -225,41 +190,35 @@ async def listkeys(interaction: discord.Interaction):
         embed.add_field(name=f"`{key}`", value=f"{info['discord_name']} ({info['discord_id']}) — expires in {int(remaining.total_seconds()//60)}m", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+@tree.command(name="deletekey", description="Delete a specific key")
+async def deletekey(interaction: discord.Interaction, key: str):
+    if key in valid_keys:
+        del valid_keys[key]
+        await interaction.response.send_message(f"🗑️ Key `{key}` deleted.", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Key not found.", ephemeral=True)
 
-@tree.command(name="script", description="Get loader link for a script id")
-async def script(interaction: discord.Interaction, script_name: str):
-    script_id = script_name.lower()
-    file_id = ''.join(random.choices('abcdef0123456789', k=40))
-    url = f"https://{RENDER_DOMAIN}/files/loaders/{script_id}/{file_id}.lua"
-    # DM the user the loader; they must set script_key in their executor before running it
-    loadstring_code = f'-- put your key in `script_key` then run\\nscript_key = "YOUR_KEY"\\nloadstring(game:HttpGet("{url}"))()'
-    try:
-        await interaction.user.send(f"Your loader for `{script_id}`:\n```lua\n{loadstring_code}\n```")
-        await interaction.response.send_message("✅ Sent loader to DMs. Put your key in `script_key` and run it.", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message("Unable to DM you. Enable DMs and try again.", ephemeral=True)
-
-
-# -----------------------
-# Bot events
-# -----------------------
+# ----------------------
+# Bot setup
+# ----------------------
 @bot.event
 async def on_ready():
     global log_channel
-    print(f"Logged in as {bot.user}")
+    print(f"Logged in as {bot.user} (id: {bot.user.id})")
     await tree.sync()
     if LOG_CHANNEL_ID:
         log_channel = bot.get_channel(LOG_CHANNEL_ID)
         if log_channel:
-            print("Logging channel ready:", log_channel.id)
+            print(f"Logging to channel: {log_channel.id}")
+        else:
+            print("Warning: LOG_CHANNEL_ID set but channel not found (bot may lack permissions).")
 
-
-# -----------------------
-# Run Flask + Bot
-# -----------------------
+# ----------------------
+# Run both
+# ----------------------
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
-    bot.run(os.getenv("DISCORD_TOKEN"))
+    bot.run(DISCORD_TOKEN)
