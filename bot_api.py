@@ -16,35 +16,139 @@ app = Flask(__name__)
 # In-memory key storage (replace with Redis or DB later if needed)
 valid_keys = {}
 
+# -- LuArmor-style HTML (shows when no valid key provided) --
+LUARMOR_HTML = r'''
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Loadstring</title>
+  <style>
+    :root { --bg:#0f1724; --card:#0b1220; --accent:#9b6bff; --muted:#9aa4b2; --text:#e6eef8; }
+    body{margin:0;font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center;height:100vh}
+    .card{width:760px;background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));padding:28px;border-radius:12px;box-shadow:0 6px 30px rgba(0,0,0,0.45);border:1px solid rgba(255,255,255,0.02)}
+    h1{display:flex;align-items:center;font-size:18px;margin:0 0 10px 0}
+    .codebox{background:var(--card);padding:16px;border-radius:8px;overflow:hidden;border:1px solid rgba(255,255,255,0.03)}
+    pre{margin:0;color:var(--muted);white-space:nowrap;overflow:auto}
+    .note{margin-top:12px;color:var(--muted);font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="card" role="main" aria-labelledby="title">
+    <h1 id="title">📜 Loadstring <span style="margin-left:auto;color:var(--muted)">Contents cannot be displayed on browser</span></h1>
+    <div class="codebox">
+      <pre id="code">
+-- script_key = "KEY"; -- A key might be required, if not, delete this line.
+loadstring(game:HttpGet("https://{domain}/files/loaders/{script_id}/{file_id}.lua?key=YOUR_KEY"))()
+      </pre>
+    </div>
+    <div class="note">This page intentionally hides the script source. Use the provided loader key in your executor.</div>
+  </div>
+</body>
+</html>
+'''
+
+
+# Default Lua script (your provided LocalScript). Used if no env var for the script id exists.
+DEFAULT_LOCALSCRIPT = r'''-- Put this LocalScript in StarterGui
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "EmptyGameTP_GUI"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = playerGui
+
+local button = Instance.new("TextButton")
+button.Name = "EmptyGameTP_Button"
+button.Size = UDim2.new(0, 180, 0, 40)
+button.Position = UDim2.new(0.5, -90, 0.5, -20)
+button.Text = "EmptyGameTP"
+button.Font = Enum.Font.GothamBold
+button.TextSize = 16
+button.BackgroundColor3 = Color3.fromRGB(45,45,45)
+button.TextColor3 = Color3.fromRGB(255,255,255)
+button.BorderSizePixel = 0
+button.Parent = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0,8)
+corner.Parent = button
+
+button.MouseButton1Click:Connect(function()
+    -- If a TPExploit with ToggleButton exists, try to toggle it
+    if TPExploit and type(TPExploit.ToggleButton) == "function" then
+        pcall(function() TPExploit.ToggleButton() end)
+    end
+
+    -- Try to get teleport data (if function exists)
+    local extraData = nil
+    if type(TeleportService.GetLocalPlayerTeleportData) == "function" then
+        local ok, res = pcall(function()
+            return TeleportService:GetLocalPlayerTeleportData()
+        end)
+        if ok then extraData = res end
+    end
+
+    -- Teleport the local player (safe pcall)
+    pcall(function()
+        TeleportService:Teleport(game.PlaceId, player, extraData)
+    end)
+end)
+'''
+
+
 @app.route("/files/loaders/<script_id>/<file_id>.lua")
-def serve_script(script_id, file_id):
-    """Serve a Lua script only if a valid key is provided."""
-    key = request.args.get("key")
-    if not key or key not in valid_keys:
-        return Response('-- Invalid or missing key. Access denied.', mimetype="text/plain"), 403
+def serve_loader(script_id, file_id):
+    """
+    Serve actual Lua if ?key=<key> is present and valid.
+    Otherwise return a LuArmor-style HTML page (no source revealed).
+    """
+    token = request.args.get("key")
+    if token and token in valid_keys:
+        # token valid -> return script code (from env var SCRIPTID or fallback default)
+        env_name = script_id.upper()
+        # The user asked environment variable mapping to be like TEST_SCRIPT etc.
+        # We attempt both styles: TEST_SCRIPT and SCRIPT_TEST to be flexible.
+        script_code = os.getenv(env_name) or os.getenv(f"SCRIPT_{env_name}") or None
 
-    env_var_name = script_id.upper()
-    script_code = os.getenv(env_var_name)
-    if not script_code:
-        return jsonify({"error": "Unknown script ID"}), 404
+        if not script_code:
+            # fallback to the LocalScript you provided
+            script_code = DEFAULT_LOCALSCRIPT
 
-    # Log to Discord channel when someone runs the script
-    user_info = valid_keys[key]
-    if "log_channel" in globals() and log_channel:
-        embed = discord.Embed(
-            title="🧩 Script Executed",
-            color=discord.Color.green(),
-            timestamp=datetime.utcnow()
-        )
-        embed.add_field(name="Roblox User", value=f"{user_info.get('roblox_name', 'Unknown')} ({user_info.get('roblox_id', 'N/A')})", inline=False)
-        embed.add_field(name="Script ID", value=script_id, inline=False)
-        embed.add_field(name="Key", value=f"`{key}`", inline=False)
-        embed.set_footer(text="Auth System Log")
+        # Log to Discord channel when a valid key fetches the script
+        try:
+            user_info = valid_keys.get(token, {})
+            if "log_channel" in globals() and log_channel:
+                embed = discord.Embed(
+                    title="🧩 Script Executed",
+                    color=discord.Color.green(),
+                    timestamp=datetime.utcnow()
+                )
+                # We may not have roblox info here; log discord creator info who generated key
+                embed.add_field(name="Key", value=f"`{token}`", inline=False)
+                embed.add_field(name="Script ID", value=script_id, inline=False)
+                embed.add_field(name="Key Creator (Discord)", value=f"{user_info.get('discord_name', 'unknown')} ({user_info.get('discord_id', 'N/A')})", inline=False)
+                embed.set_footer(text="Auth System Log")
 
-        view = RevokeButton(key)
-        bot.loop.create_task(log_channel.send(embed=embed, view=view))
+                view = RevokeButton(token)
+                # send embed asynchronously
+                bot.loop.create_task(log_channel.send(embed=embed, view=view))
+        except Exception:
+            # logging should not prevent script delivery
+            pass
 
-    return Response(script_code, mimetype="text/plain")
+        return Response(script_code, mimetype="text/plain")
+
+    # No valid token -> show LuArmor-like page (no script source)
+    html = LUARMOR_HTML.format(
+        domain=os.getenv("RENDER_DOMAIN", request.host),
+        script_id=script_id,
+        file_id=file_id
+    )
+    return Response(html, mimetype="text/html")
 
 
 # =====================
