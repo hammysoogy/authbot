@@ -2,7 +2,7 @@ import os
 import random
 import string
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, Response
 import discord
 from discord.ext import commands
@@ -13,8 +13,11 @@ from discord import app_commands, ui, ButtonStyle
 # ============================================================
 app = Flask(__name__)
 
-# In-memory key storage (can switch to Redis or DB later)
+# In-memory key storage
 valid_keys = {}
+
+# Key lifetime (in minutes)
+KEY_LIFETIME_MINUTES = 10
 
 # ======================
 # DEFAULT SCRIPT CONTENT
@@ -48,12 +51,10 @@ corner.CornerRadius = UDim.new(0,8)
 corner.Parent = button
 
 button.MouseButton1Click:Connect(function()
-    -- If a TPExploit with ToggleButton exists, try to toggle it
     if TPExploit and type(TPExploit.ToggleButton) == "function" then
         pcall(function() TPExploit.ToggleButton() end)
     end
 
-    -- Try to get teleport data (if function exists)
     local extraData = nil
     if type(TeleportService.GetLocalPlayerTeleportData) == "function" then
         local ok, res = pcall(function()
@@ -62,7 +63,6 @@ button.MouseButton1Click:Connect(function()
         if ok then extraData = res end
     end
 
-    -- Teleport the local player (safe pcall)
     pcall(function()
         TeleportService:Teleport(game.PlaceId, player, extraData)
     end)
@@ -78,15 +78,22 @@ def serve_script(script_id, file_id):
     """Serve a Lua script only if a valid key is provided."""
     key = request.args.get("key")
 
-    # Require valid key
+    # Validate key
     if not key or key not in valid_keys:
         return Response("-- Invalid or missing key. Access denied.", mimetype="text/plain"), 403
+
+    key_info = valid_keys[key]
+    # Expire key if too old
+    created_at = datetime.fromisoformat(key_info["created_at"])
+    if datetime.utcnow() - created_at > timedelta(minutes=KEY_LIFETIME_MINUTES):
+        del valid_keys[key]
+        return Response("-- Key expired. Please generate a new one.", mimetype="text/plain"), 403
 
     # Fetch script code from environment or fallback
     env_var_name = script_id.upper()
     script_code = os.getenv(env_var_name, DEFAULT_SCRIPT)
 
-    # Log script execution
+    # Log execution
     user_info = valid_keys[key]
     if "log_channel" in globals() and log_channel:
         embed = discord.Embed(
@@ -147,7 +154,7 @@ class RevokeButton(ui.View):
 # ============================================================
 # Slash Commands
 # ============================================================
-@tree.command(name="genkey", description="Generate a one-time script key")
+@tree.command(name="genkey", description="Generate a one-time script key (expires in 10 min)")
 async def genkey(interaction: discord.Interaction):
     key = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
     valid_keys[key] = {
@@ -155,7 +162,10 @@ async def genkey(interaction: discord.Interaction):
         "discord_id": interaction.user.id,
         "created_at": datetime.utcnow().isoformat()
     }
-    await interaction.response.send_message(f"✅ Key generated: `{key}`", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Key generated: `{key}` (expires in {KEY_LIFETIME_MINUTES} minutes)",
+        ephemeral=True
+    )
 
 
 @tree.command(name="deletekey", description="Delete a specific key")
@@ -174,15 +184,27 @@ async def listkeys(interaction: discord.Interaction):
         return
 
     embed = discord.Embed(title="🔑 Active Keys", color=discord.Color.blue())
-    for key, info in valid_keys.items():
-        created = info.get('created_at', 'unknown')
+    now = datetime.utcnow()
+
+    for key, info in list(valid_keys.items()):
+        created = datetime.fromisoformat(info["created_at"])
+        elapsed = now - created
+        remaining = timedelta(minutes=KEY_LIFETIME_MINUTES) - elapsed
+
+        if remaining.total_seconds() <= 0:
+            del valid_keys[key]
+            continue
+
         embed.add_field(
             name=f"`{key}`",
-            value=f"👤 {info['discord_name']} (`{info['discord_id']}`)\n🕒 Created: {created}",
+            value=f"👤 {info['discord_name']} (`{info['discord_id']}`)\n🕒 Expires in: {int(remaining.total_seconds() // 60)} min",
             inline=False
         )
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    if len(embed.fields) == 0:
+        await interaction.response.send_message("All keys expired.", ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @tree.command(name="script", description="Get a loader for your script")
@@ -194,7 +216,7 @@ async def script(interaction: discord.Interaction, script_name: str):
     loadstring_code = f'loadstring(game:HttpGet("{url}"))()'
     await interaction.user.send(
         f"✅ Your loader for `{script_name}`:\n```lua\n{loadstring_code}\n```\n"
-        "Replace `{key}` with your generated key from `/genkey`."
+        f"Replace `{{key}}` with your generated key from `/genkey`.\n⚠️ Expires in {KEY_LIFETIME_MINUTES} minutes."
     )
     await interaction.response.send_message("📩 Check your DMs for the loader!", ephemeral=True)
 
