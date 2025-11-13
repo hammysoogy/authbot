@@ -1,125 +1,123 @@
 import os
 import random
 import string
+from flask import Flask, request, jsonify, Response
 import discord
 from discord.ext import commands
-from discord import app_commands
-from datetime import datetime
-from flask import Flask, jsonify
+from discord import app_commands, ui, ButtonStyle
 
-# --- Discord setup ---
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
-TOKEN = os.getenv("DISCORD_TOKEN")
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
-
-# --- Flask setup (Render will use this) ---
+# =====================
+# Flask API
+# =====================
 app = Flask(__name__)
 
-# --- In-memory key storage (replace with Redis or database later) ---
-keys = {}  # {key: {"used": False, "user": None, "script_id": None}}
-active_scripts = {}  # {user_id: script_id}
+# In-memory key storage (replace with Redis or database later if needed)
+valid_keys = {}
+
+@app.route("/files/loaders/<script_id>/<file_id>.lua")
+def serve_script(script_id, file_id):
+    """Serve a Lua script only if a valid key is provided."""
+    key = request.args.get("key")
+    if not key or key not in valid_keys:
+        return Response('-- Invalid or missing key. Access denied.', mimetype="text/plain"), 403
+
+    env_var_name = script_id.upper()
+    script_code = os.getenv(env_var_name)
+    if not script_code:
+        return jsonify({"error": "Unknown script ID"}), 404
+
+    # Log to Discord channel when someone runs the script
+    user_info = valid_keys[key]
+    if "log_channel" in globals():
+        embed = discord.Embed(
+            title="🧩 Script Executed",
+            description=f"**User:** {user_info['discord_name']}\n**Key:** `{key}`\n**Script:** `{script_id}`",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="Auth System Log")
+        view = RevokeButton(key)
+        bot.loop.create_task(log_channel.send(embed=embed, view=view))
+
+    return Response(script_code, mimetype="text/plain")
 
 
-# --- Helper function to generate random keys ---
-def generate_key():
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
+# =====================
+# Discord Bot Setup
+# =====================
+intents = discord.Intents.default()
+intents.messages = True
+intents.guilds = True
+bot = commands.Bot(command_prefix="/", intents=intents)
+tree = bot.tree
 
 
-# --- Discord Views ---
-class RevokeKeyView(discord.ui.View):
+class RevokeButton(ui.View):
     def __init__(self, key):
         super().__init__(timeout=None)
         self.key = key
 
-    @discord.ui.button(label="Revoke Key", style=discord.ButtonStyle.danger)
-    async def revoke(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.key in keys:
-            del keys[self.key]
-            await interaction.response.send_message(f"✅ Key `{self.key}` revoked successfully!", ephemeral=True)
+    @ui.button(label="Revoke Key", style=ButtonStyle.danger)
+    async def revoke(self, interaction: discord.Interaction, button: ui.Button):
+        if self.key in valid_keys:
+            del valid_keys[self.key]
+            await interaction.response.send_message(
+                f"🔒 Key `{self.key}` has been revoked and is now invalid!", ephemeral=True
+            )
         else:
-            await interaction.response.send_message("⚠️ This key has already been revoked or doesn’t exist.", ephemeral=True)
+            await interaction.response.send_message("❌ Key already invalid or revoked.", ephemeral=True)
 
 
-# --- Commands ---
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    print(f"✅ Logged in as {bot.user}")
-
-
-@bot.tree.command(name="genkey", description="Generate a new one-time key")
+@tree.command(name="genkey", description="Generate a one-time script key")
 async def genkey(interaction: discord.Interaction):
-    key = generate_key()
-    keys[key] = {"used": False, "user": None, "script_id": None}
-    await interaction.response.send_message(f"✅ Your key: `{key}` (one-time use)", ephemeral=True)
+    key = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    valid_keys[key] = {"discord_name": interaction.user.name}
+    await interaction.response.send_message(f"✅ Key generated: `{key}`", ephemeral=True)
 
 
-@bot.tree.command(name="delete", description="Delete/revoke a key manually")
-@app_commands.describe(key="The key to revoke")
-async def delete(interaction: discord.Interaction, key: str):
-    if key in keys:
-        del keys[key]
+@tree.command(name="deletekey", description="Delete a specific key")
+async def deletekey(interaction: discord.Interaction, key: str):
+    if key in valid_keys:
+        del valid_keys[key]
         await interaction.response.send_message(f"🗑️ Key `{key}` deleted.", ephemeral=True)
     else:
-        await interaction.response.send_message("⚠️ Key not found.", ephemeral=True)
+        await interaction.response.send_message("❌ Key not found.", ephemeral=True)
 
 
-@bot.tree.command(name="script", description="Get your unique script")
-async def script(interaction: discord.Interaction):
-    script_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-    active_scripts[interaction.user.id] = script_id
+@tree.command(name="script", description="Get a loader for your script")
+async def script(interaction: discord.Interaction, script_name: str):
+    script_id = script_name.lower()
+    random_file_id = ''.join(random.choices('abcdef0123456789', k=40))
+    url = f"https://{os.getenv('RENDER_DOMAIN')}/files/loaders/{script_id}/{random_file_id}.lua?key={{key}}"
 
-    loader = f'loadstring(game:HttpGet("https://authbot-hn9s.onrender.com/files/loaders/{script_id}.lua"))()'
-    await interaction.user.send(f"🧠 **Your script ID:** `{script_id}`\n\nPaste this in your executor:\n```lua\n{loader}\n```")
-    await interaction.response.send_message("📩 Sent your loader to DMs!", ephemeral=True)
-
-
-# --- Web endpoint: Key redemption ---
-@app.route("/redeem/<key>/<script_id>/<user>", methods=["GET"])
-def redeem(key, script_id, user):
-    if key not in keys:
-        return jsonify({"success": False, "message": "Invalid key"}), 403
-
-    if keys[key]["used"]:
-        return jsonify({"success": False, "message": "Key already used"}), 403
-
-    keys[key]["used"] = True
-    keys[key]["user"] = user
-    keys[key]["script_id"] = script_id
-
-    # Log to Discord
-    embed = discord.Embed(title="🔑 Key Redeemed", color=discord.Color.green())
-    embed.add_field(name="Script ID", value=script_id, inline=False)
-    embed.add_field(name="Key", value=f"`{key}`", inline=False)
-    embed.add_field(name="Redeemed by", value=user, inline=False)
-    embed.set_footer(text=f"Redeemed at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-
-    view = RevokeKeyView(key)
-
-    async def send_embed():
-        channel = bot.get_channel(LOG_CHANNEL_ID)
-        if channel:
-            await channel.send(embed=embed, view=view)
-
-    bot.loop.create_task(send_embed())
-
-    return jsonify({"success": True, "message": "yay u done it auth system up and working!"})
+    loadstring_code = f'loadstring(game:HttpGet("{url}"))()'
+    await interaction.user.send(
+        f"✅ Your loader for `{script_name}`:\n```lua\n{loadstring_code}\n```\n"
+        "Replace `{key}` with your generated key from `/genkey`."
+    )
+    await interaction.response.send_message("📩 Check your DMs for the loader!", ephemeral=True)
 
 
-# --- Web endpoint: Key validation ---
-@app.route("/api/validate/<key>", methods=["GET"])
-def validate_key(key):
-    if key in keys and not keys[key]["used"]:
-        return jsonify({"valid": True})
-    return jsonify({"valid": False})
+@bot.event
+async def on_ready():
+    global log_channel
+    print(f"✅ Logged in as {bot.user}")
+    await tree.sync()
+
+    log_channel_id = int(os.getenv("LOG_CHANNEL_ID", "0"))
+    if log_channel_id:
+        log_channel = bot.get_channel(log_channel_id)
+        if log_channel:
+            print(f"📝 Logging to channel: {log_channel.name}")
 
 
-# --- Run bot + web ---
+# =====================
+# Run Flask + Discord Together
+# =====================
 import threading
 
 def run_flask():
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
 
-threading.Thread(target=run_flask).start()
-bot.run(TOKEN)
+if __name__ == "__main__":
+    threading.Thread(target=run_flask).start()
+    bot.run(os.getenv("DISCORD_TOKEN"))
