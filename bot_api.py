@@ -11,82 +11,76 @@ from discord import ui, ButtonStyle
 # ----------------------
 # Configuration
 # ----------------------
-KEY_LIFETIME_MINUTES = int(os.getenv("KEY_LIFETIME_MINUTES", "10"))
+DEFAULT_KEY_LIFETIME_MINUTES = int(os.getenv("KEY_LIFETIME_MINUTES", "10"))
 RENDER_DOMAIN = os.getenv("RENDER_DOMAIN", "authbot-hn9s.onrender.com")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# The external script URL you want the loader to execute
+# The external script URL you want to execute
 EXTERNAL_SCRIPT_URL = "https://pastefy.app/1YBZrX1C/raw"
 
 # ----------------------
 # App + in-memory store
 # ----------------------
 app = Flask(__name__)
-valid_keys = {}  # key -> {discord_name, discord_id, created_at, script_id(optional)}
+valid_keys = {}  # key -> info dict
 
 # ----------------------
-# Helper functions
+# Helper
 # ----------------------
-def make_key(owner_name: str, owner_id: int, script_id: str = None):
+def make_key(owner_name: str, owner_id: int, script_id: str = None, lifetime=None):
     key = ''.join(random.choices(string.ascii_letters + string.digits, k=24))
+    expires_at = None
+    if lifetime != "infinite":
+        minutes = lifetime or DEFAULT_KEY_LIFETIME_MINUTES
+        expires_at = (datetime.utcnow() + timedelta(minutes=minutes)).isoformat()
+
     valid_keys[key] = {
         "discord_name": owner_name,
         "discord_id": owner_id,
         "created_at": datetime.utcnow().isoformat(),
+        "expires_at": expires_at,
         "script_id": script_id,
     }
     return key
 
-def key_is_valid_and_consume(key: str, script_id: str = None) -> (bool, str):
-    """
-    Validate TTL and script id if provided. If valid, consume (delete) the key and return (True, "").
-    If invalid, return (False, reason).
-    """
+
+def key_is_valid(key: str, script_id: str = None):
     info = valid_keys.get(key)
     if not info:
         return False, "invalid_or_missing"
-    created = datetime.fromisoformat(info["created_at"])
-    if datetime.utcnow() - created > timedelta(minutes=KEY_LIFETIME_MINUTES):
-        # expired
-        del valid_keys[key]
-        return False, "expired"
-    # optional script scope
+    if info["expires_at"]:
+        expires_at = datetime.fromisoformat(info["expires_at"])
+        if datetime.utcnow() > expires_at:
+            del valid_keys[key]
+            return False, "expired"
     if info.get("script_id") and script_id and info["script_id"] != script_id:
         return False, "script_mismatch"
-    # consume
-    try:
-        del valid_keys[key]
-    except KeyError:
-        pass
     return True, ""
 
+
 # ----------------------
-# Flask route: serve lua when ?key= is provided
+# Flask route
 # ----------------------
 @app.route("/files/loaders/<script_id>/<file_id>.lua")
-def serve_loader_with_key(script_id, file_id):
-    """
-    If ?key= is present and valid, return a small loader Lua which fetches and runs EXTERNAL_SCRIPT_URL.
-    Otherwise deny (403) with a short message (no script disclosure).
-    """
+def serve_loader(script_id, file_id):
     key = request.args.get("key")
     if not key:
-        return Response("-- Missing key parameter. Access denied.", mimetype="text/plain"), 403
+        return Response("-- Missing key. Access denied.", mimetype="text/plain"), 403
 
-    ok, reason = key_is_valid_and_consume(key, script_id=script_id)
+    ok, reason = key_is_valid(key, script_id)
     if not ok:
-        # do not reveal details beyond a short reason
-        if reason == "expired":
-            return Response("-- Key expired. Please generate a new key.", mimetype="text/plain"), 403
-        if reason == "script_mismatch":
-            return Response("-- Key not valid for this script.", mimetype="text/plain"), 403
-        return Response("-- Invalid or missing key. Access denied.", mimetype="text/plain"), 403
+        msg = {
+            "invalid_or_missing": "-- Invalid key. Access denied.",
+            "expired": "-- Key expired. Generate a new one.",
+            "script_mismatch": "-- Key not valid for this script."
+        }.get(reason, "-- Access denied.")
+        return Response(msg, mimetype="text/plain"), 403
 
-    # Build loader Lua that executes the external script URL
-    # This loader is minimal and immediately runs the external raw URL via game:HttpGet + loadstring.
+    # Return loader that runs your external Pastefy script
     loader_lua = (
-        f'-- Loader returned by auth server (executes external script)\n'
+        f'-- Authenticated loader\n'
+        f'-- Key: {key}\n'
         f'local ok, res = pcall(function() return game:HttpGet("{EXTERNAL_SCRIPT_URL}") end)\n'
         f'if not ok or not res then warn("Failed to fetch external script:", res); return end\n'
         f'local fn, err = loadstring(res)\n'
@@ -94,7 +88,7 @@ def serve_loader_with_key(script_id, file_id):
         f'pcall(fn)\n'
     )
 
-    # Log to Discord (non-blocking)
+    # Log use to Discord
     try:
         if LOG_CHANNEL_ID and bot and bot.is_ready():
             embed = discord.Embed(
@@ -103,7 +97,7 @@ def serve_loader_with_key(script_id, file_id):
                 timestamp=datetime.utcnow()
             )
             embed.add_field(name="Script ID", value=script_id, inline=False)
-            embed.add_field(name="Key (consumed)", value=f"`{key}`", inline=False)
+            embed.add_field(name="Key Used", value=f"`{key}`", inline=False)
             embed.set_footer(text="Auth System Log")
             view = RevokeButton(key)
             bot.loop.create_task(log_channel.send(embed=embed, view=view))
@@ -111,6 +105,7 @@ def serve_loader_with_key(script_id, file_id):
         pass
 
     return Response(loader_lua, mimetype="text/plain")
+
 
 # ----------------------
 # Discord Bot Setup
@@ -122,8 +117,9 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 log_channel = None
 
+
 # ----------------------
-# Revoke button view
+# Revoke Button
 # ----------------------
 class RevokeButton(ui.View):
     def __init__(self, key):
@@ -132,7 +128,6 @@ class RevokeButton(ui.View):
 
     @ui.button(label="Revoke Key", style=ButtonStyle.danger)
     async def revoke(self, interaction: discord.Interaction, button: ui.Button):
-        # If key exists (unlikely after consumption) remove it; otherwise report already consumed
         if self.key in valid_keys:
             del valid_keys[self.key]
             await interaction.response.send_message(f"🔒 Key `{self.key}` revoked.", ephemeral=True)
@@ -140,55 +135,71 @@ class RevokeButton(ui.View):
                 embed = interaction.message.embeds[0]
                 new_embed = embed.copy()
                 new_embed.color = discord.Color.red()
-                new_embed.add_field(name="Revoked By", value=f"{interaction.user} ({interaction.user.id})", inline=False)
+                new_embed.add_field(name="Revoked By", value=f"{interaction.user}", inline=False)
                 await interaction.message.edit(embed=new_embed, view=None)
             except Exception:
                 pass
         else:
-            await interaction.response.send_message("❌ Key already consumed or revoked.", ephemeral=True)
+            await interaction.response.send_message("❌ Key already invalid.", ephemeral=True)
+
 
 # ----------------------
-# Slash commands
+# Slash Commands
 # ----------------------
-@tree.command(name="genkey", description="Generate a one-time script key (optionally tied to a script id)")
-async def genkey(interaction: discord.Interaction, script_name: str = None):
+@tree.command(name="genkey", description="Generate a reusable script key (optionally set minutes or 'infinite')")
+async def genkey(interaction: discord.Interaction, script_name: str = None, lifetime: str = None):
     script_id = script_name.lower() if script_name else None
-    k = make_key(interaction.user.name, interaction.user.id, script_id=script_id)
-    # DM user the key and instructions
-    url_example = f'https://{RENDER_DOMAIN}/files/loaders/{script_id or "script_id"}/<fileid>.lua?key={k}'
-    try:
-        await interaction.user.send(f"🔑 Your key: `{k}`\nLoader example:\n```lua\nloadstring(game:HttpGet(\"{url_example}\"))()\n```")
-        await interaction.response.send_message("✅ Key generated and DM'd to you.", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message(f"✅ Key: `{k}` (unable to DM) — use the URL: {url_example}", ephemeral=True)
+    lifetime_value = None
+    if lifetime:
+        if lifetime.lower() == "infinite":
+            lifetime_value = "infinite"
+        else:
+            try:
+                lifetime_value = int(lifetime)
+            except ValueError:
+                await interaction.response.send_message("⚠️ Invalid lifetime. Use a number (minutes) or 'infinite'.", ephemeral=True)
+                return
 
-@tree.command(name="script", description="Get a loader URL for a script id (placeholder key)")
-async def script(interaction: discord.Interaction, script_name: str):
-    script_id = script_name.lower()
+    key = make_key(interaction.user.name, interaction.user.id, script_id, lifetime=lifetime_value)
     file_id = ''.join(random.choices('abcdef0123456789', k=40))
-    url = f"https://{RENDER_DOMAIN}/files/loaders/{script_id}/{file_id}.lua?key={{key}}"
-    loadstring_code = f'loadstring(game:HttpGet("{url}"))()'
-    try:
-        await interaction.user.send(f"Loader for `{script_id}`:\n```lua\n{loadstring_code}\n```")
-        await interaction.response.send_message("📩 Sent loader URL to your DMs (replace {key} with your key)", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message(f"Loader: ```lua\n{loadstring_code}\n```", ephemeral=True)
+    url = f"https://{RENDER_DOMAIN}/files/loaders/{script_id or 'script'}/{file_id}.lua?key={key}"
+    code = f'loadstring(game:HttpGet("{url}"))()'
 
-@tree.command(name="listkeys", description="List active (unexpired) keys")
+    try:
+        await interaction.user.send(f"✅ Key generated: `{key}`\nLifetime: `{lifetime or DEFAULT_KEY_LIFETIME_MINUTES}` minutes\n```lua\n{code}\n```")
+        await interaction.response.send_message("📩 Key sent to your DMs.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(f"✅ Key: `{key}`\n```lua\n{code}\n```", ephemeral=True)
+
+
+@tree.command(name="listkeys", description="List all currently valid keys")
 async def listkeys(interaction: discord.Interaction):
     if not valid_keys:
         await interaction.response.send_message("No active keys.", ephemeral=True)
         return
-    embed = discord.Embed(title="🔑 Active Keys", color=discord.Color.blue())
+
+    embed = discord.Embed(title="🔑 Active Keys", color=discord.Color.blurple())
     now = datetime.utcnow()
     for key, info in list(valid_keys.items()):
-        created = datetime.fromisoformat(info["created_at"])
-        remaining = timedelta(minutes=KEY_LIFETIME_MINUTES) - (now - created)
-        if remaining.total_seconds() <= 0:
-            del valid_keys[key]
-            continue
-        embed.add_field(name=f"`{key}`", value=f"{info['discord_name']} ({info['discord_id']}) — expires in {int(remaining.total_seconds()//60)}m", inline=False)
+        exp = info["expires_at"]
+        if exp:
+            exp_dt = datetime.fromisoformat(exp)
+            if exp_dt < now:
+                del valid_keys[key]
+                continue
+            remaining = int((exp_dt - now).total_seconds() / 60)
+            remain_str = f"{remaining}m left"
+        else:
+            remain_str = "∞ Infinite"
+
+        embed.add_field(
+            name=f"`{key}`",
+            value=f"👤 {info['discord_name']} ({info['discord_id']})\n⏳ {remain_str}",
+            inline=False
+        )
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 @tree.command(name="deletekey", description="Delete a specific key")
 async def deletekey(interaction: discord.Interaction, key: str):
@@ -198,26 +209,28 @@ async def deletekey(interaction: discord.Interaction, key: str):
     else:
         await interaction.response.send_message("❌ Key not found.", ephemeral=True)
 
+
 # ----------------------
-# Bot setup
+# Bot Events
 # ----------------------
 @bot.event
 async def on_ready():
     global log_channel
-    print(f"Logged in as {bot.user} (id: {bot.user.id})")
+    print(f"✅ Logged in as {bot.user}")
     await tree.sync()
     if LOG_CHANNEL_ID:
         log_channel = bot.get_channel(LOG_CHANNEL_ID)
         if log_channel:
-            print(f"Logging to channel: {log_channel.id}")
+            print(f"📝 Logging to: {log_channel.name}")
         else:
-            print("Warning: LOG_CHANNEL_ID set but channel not found (bot may lack permissions).")
+            print("⚠️ Log channel not found.")
+
 
 # ----------------------
-# Run both
+# Run Flask + Bot
 # ----------------------
 def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
