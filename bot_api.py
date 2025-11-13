@@ -8,49 +8,19 @@ import discord
 from discord.ext import commands
 from discord import app_commands, ui, ButtonStyle
 
-# =====================
+# ============================================================
 # Flask API
-# =====================
+# ============================================================
 app = Flask(__name__)
 
-# In-memory key storage (replace with Redis or DB later if needed)
+# In-memory key storage (can switch to Redis or DB later)
 valid_keys = {}
 
-# -- LuArmor-style HTML (shows when no valid key provided) --
-LUARMOR_HTML = r'''
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Loadstring</title>
-  <style>
-    :root { --bg:#0f1724; --card:#0b1220; --accent:#9b6bff; --muted:#9aa4b2; --text:#e6eef8; }
-    body{margin:0;font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center;height:100vh}
-    .card{width:760px;background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));padding:28px;border-radius:12px;box-shadow:0 6px 30px rgba(0,0,0,0.45);border:1px solid rgba(255,255,255,0.02)}
-    h1{display:flex;align-items:center;font-size:18px;margin:0 0 10px 0}
-    .codebox{background:var(--card);padding:16px;border-radius:8px;overflow:hidden;border:1px solid rgba(255,255,255,0.03)}
-    pre{margin:0;color:var(--muted);white-space:nowrap;overflow:auto}
-    .note{margin-top:12px;color:var(--muted);font-size:13px}
-  </style>
-</head>
-<body>
-  <div class="card" role="main" aria-labelledby="title">
-    <h1 id="title">📜 Loadstring <span style="margin-left:auto;color:var(--muted)">Contents cannot be displayed on browser</span></h1>
-    <div class="codebox">
-      <pre id="code">
--- script_key = "KEY"; -- A key might be required, if not, delete this line.
-loadstring(game:HttpGet("https://{domain}/files/loaders/{script_id}/{file_id}.lua?key=YOUR_KEY"))()
-      </pre>
-    </div>
-    <div class="note">This page intentionally hides the script source. Use the provided loader key in your executor.</div>
-  </div>
-</body>
-</html>
-'''
-
-
-# Default Lua script (your provided LocalScript). Used if no env var for the script id exists.
-DEFAULT_LOCALSCRIPT = r'''-- Put this LocalScript in StarterGui
+# ======================
+# DEFAULT SCRIPT CONTENT
+# ======================
+DEFAULT_SCRIPT = r'''
+-- Teleport GUI LocalScript
 local Players = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
 local player = Players.LocalPlayer
@@ -100,60 +70,44 @@ end)
 '''
 
 
+# ============================================================
+# Script endpoint
+# ============================================================
 @app.route("/files/loaders/<script_id>/<file_id>.lua")
-def serve_loader(script_id, file_id):
-    """
-    Serve actual Lua if ?key=<key> is present and valid.
-    Otherwise return a LuArmor-style HTML page (no source revealed).
-    """
-    token = request.args.get("key")
-    if token and token in valid_keys:
-        # token valid -> return script code (from env var SCRIPTID or fallback default)
-        env_name = script_id.upper()
-        # The user asked environment variable mapping to be like TEST_SCRIPT etc.
-        # We attempt both styles: TEST_SCRIPT and SCRIPT_TEST to be flexible.
-        script_code = os.getenv(env_name) or os.getenv(f"SCRIPT_{env_name}") or None
+def serve_script(script_id, file_id):
+    """Serve a Lua script only if a valid key is provided."""
+    key = request.args.get("key")
 
-        if not script_code:
-            # fallback to the LocalScript you provided
-            script_code = DEFAULT_LOCALSCRIPT
+    # Require valid key
+    if not key or key not in valid_keys:
+        return Response("-- Invalid or missing key. Access denied.", mimetype="text/plain"), 403
 
-        # Log to Discord channel when a valid key fetches the script
-        try:
-            user_info = valid_keys.get(token, {})
-            if "log_channel" in globals() and log_channel:
-                embed = discord.Embed(
-                    title="🧩 Script Executed",
-                    color=discord.Color.green(),
-                    timestamp=datetime.utcnow()
-                )
-                # We may not have roblox info here; log discord creator info who generated key
-                embed.add_field(name="Key", value=f"`{token}`", inline=False)
-                embed.add_field(name="Script ID", value=script_id, inline=False)
-                embed.add_field(name="Key Creator (Discord)", value=f"{user_info.get('discord_name', 'unknown')} ({user_info.get('discord_id', 'N/A')})", inline=False)
-                embed.set_footer(text="Auth System Log")
+    # Fetch script code from environment or fallback
+    env_var_name = script_id.upper()
+    script_code = os.getenv(env_var_name, DEFAULT_SCRIPT)
 
-                view = RevokeButton(token)
-                # send embed asynchronously
-                bot.loop.create_task(log_channel.send(embed=embed, view=view))
-        except Exception:
-            # logging should not prevent script delivery
-            pass
+    # Log script execution
+    user_info = valid_keys[key]
+    if "log_channel" in globals() and log_channel:
+        embed = discord.Embed(
+            title="🧩 Script Executed",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name="Discord User", value=f"{user_info['discord_name']} ({user_info['discord_id']})", inline=False)
+        embed.add_field(name="Script ID", value=script_id, inline=True)
+        embed.add_field(name="Key", value=f"`{key}`", inline=False)
+        embed.set_footer(text="Auth System Log")
 
-        return Response(script_code, mimetype="text/plain")
+        view = RevokeButton(key)
+        bot.loop.create_task(log_channel.send(embed=embed, view=view))
 
-    # No valid token -> show LuArmor-like page (no script source)
-    html = LUARMOR_HTML.format(
-        domain=os.getenv("RENDER_DOMAIN", request.host),
-        script_id=script_id,
-        file_id=file_id
-    )
-    return Response(html, mimetype="text/html")
+    return Response(script_code, mimetype="text/plain")
 
 
-# =====================
+# ============================================================
 # Discord Bot Setup
-# =====================
+# ============================================================
 intents = discord.Intents.default()
 intents.messages = True
 intents.guilds = True
@@ -161,9 +115,9 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
 
-# =====================
+# ============================================================
 # Revoke Button Class
-# =====================
+# ============================================================
 class RevokeButton(ui.View):
     def __init__(self, key):
         super().__init__(timeout=None)
@@ -177,7 +131,6 @@ class RevokeButton(ui.View):
                 f"🔒 Key `{self.key}` has been revoked and is now invalid!",
                 ephemeral=True
             )
-            # Edit the embed to show revocation info
             try:
                 embed = interaction.message.embeds[0]
                 new_embed = embed.copy()
@@ -191,9 +144,9 @@ class RevokeButton(ui.View):
             await interaction.response.send_message("❌ Key already invalid or revoked.", ephemeral=True)
 
 
-# =====================
-# Discord Commands
-# =====================
+# ============================================================
+# Slash Commands
+# ============================================================
 @tree.command(name="genkey", description="Generate a one-time script key")
 async def genkey(interaction: discord.Interaction):
     key = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
@@ -214,20 +167,6 @@ async def deletekey(interaction: discord.Interaction, key: str):
         await interaction.response.send_message("❌ Key not found.", ephemeral=True)
 
 
-@tree.command(name="script", description="Get a loader for your script")
-async def script(interaction: discord.Interaction, script_name: str):
-    script_id = script_name.lower()
-    random_file_id = ''.join(random.choices('abcdef0123456789', k=40))
-    url = f"https://{os.getenv('RENDER_DOMAIN')}/files/loaders/{script_id}/{random_file_id}.lua?key={{key}}"
-
-    loadstring_code = f'loadstring(game:HttpGet("{url}"))()'
-    await interaction.user.send(
-        f"✅ Your loader for `{script_name}`:\n```lua\n{loadstring_code}\n```\n"
-        "Replace `{key}` with your generated key from `/genkey`."
-    )
-    await interaction.response.send_message("📩 Check your DMs for the loader!", ephemeral=True)
-
-
 @tree.command(name="listkeys", description="List all currently valid keys")
 async def listkeys(interaction: discord.Interaction):
     if not valid_keys:
@@ -246,9 +185,23 @@ async def listkeys(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# =====================
+@tree.command(name="script", description="Get a loader for your script")
+async def script(interaction: discord.Interaction, script_name: str):
+    script_id = script_name.lower()
+    random_file_id = ''.join(random.choices('abcdef0123456789', k=40))
+    url = f"https://{os.getenv('RENDER_DOMAIN')}/files/loaders/{script_id}/{random_file_id}.lua?key={{key}}"
+
+    loadstring_code = f'loadstring(game:HttpGet("{url}"))()'
+    await interaction.user.send(
+        f"✅ Your loader for `{script_name}`:\n```lua\n{loadstring_code}\n```\n"
+        "Replace `{key}` with your generated key from `/genkey`."
+    )
+    await interaction.response.send_message("📩 Check your DMs for the loader!", ephemeral=True)
+
+
+# ============================================================
 # Bot Events
-# =====================
+# ============================================================
 @bot.event
 async def on_ready():
     global log_channel
@@ -266,9 +219,9 @@ async def on_ready():
         print("⚠️ No LOG_CHANNEL_ID set in environment.")
 
 
-# =====================
+# ============================================================
 # Run Flask + Discord Together
-# =====================
+# ============================================================
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
 
